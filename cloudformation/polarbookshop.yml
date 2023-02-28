@@ -1,0 +1,428 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: aws-polar-bookshop
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: aws-polar-bookshop
+    Description: "A friendly environment name that will be used for namespacing all cluster resources."
+  PrivateDNSNamespaceName:
+    Type: String
+    Default: service
+    Description: "The private DNS name that identifies the name that you want to use to locate your resources"
+  MinContainersCatalogService:
+    Type: Number
+    Default: 1
+    Description: "Minimum number of ECS tasks per ECS service"
+  MaxContainersCatalogServices:
+    Type: Number
+    Default: 2
+    Description: "Maximum number of ECS tasks per ECS service"
+  AutoScalingTargetValueCatalogService:
+    Type: Number
+    Default: 50
+    Description: "Target CPU utilizatio (%) for ECS services auto scaling"
+  Role:
+    Type: String
+    Default: ""
+    Description: (Optional) An IAM role to give the service's containers if the code within needs to
+      access other AWS resources like S3 buckets, DynamoDB tables, etc
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Generic"
+        Parameters:
+          - EnvironmentName
+          - PrivateDNSNamespaceName
+      -
+        Label:
+          default: "Polar Bookshop Catalog Service"
+        Parameters:
+          - MinContainersCatalogService
+          - MaxContainersCatalogServices
+          - AutoScalingTargetValueCatalogService
+
+Mappings:
+  SubnetConfig:
+    VPC:
+      CIDR: '10.0.0.0/16'
+    PublicOne:
+      CIDR: '10.0.0.0/24'
+    PrivateOne:
+      CIDR: '10.0.100.0/24'
+
+Resources:
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !FindInMap [ 'SubnetConfig', 'VPC', 'CIDR' ]
+
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId: !Ref 'VPC'
+      CidrBlock: !FindInMap [ 'SubnetConfig', 'PublicOne', 'CIDR' ]
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId: !Ref 'VPC'
+      CidrBlock: !FindInMap [ 'SubnetConfig', 'PrivateOne', 'CIDR' ]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachement:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref 'VPC'
+      InternetGatewayId: !Ref 'InternetGateway'
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'VPC'
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachement
+    Properties:
+      RouteTableId: !Ref 'PublicRouteTable'
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref 'InternetGateway'
+  PublicSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetOne
+      RouteTableId: !Ref PublicRouteTable
+
+  NatGatewayOneAttachment:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachement
+    Properties:
+      Domain: vpc
+  NatGatewayOne:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayOneAttachment.AllocationId
+      SubnetId: !Ref PublicSubnetOne
+  PrivateRouteTableOne:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'VPC'
+  PrivateRouteOne:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableOne
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayOne
+  PrivateRouteTableOneAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableOne
+      SubnetId: !Ref PrivateSubnetOne
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the Fargate containers
+      VpcId: !Ref 'VPC'
+  ContainerSecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ContainerSecurityGroup
+      SourceSecurityGroupId: !Ref ContainerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9001
+      ToPort: 9001
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole'
+
+  ECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ ecs.amazonaws.com ]
+            Action: [ 'sts:AssumeRole' ]
+      Path: /
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:AttachNetworkInterface'
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:CreateNetworkInterfacePermission'
+                  - 'ec2:DeleteNetworkInterface'
+                  - 'ec2:DeleteNetworkInterfacePermission'
+                  - 'ec2:Describe*'
+                  - 'ec2:DetachNetworkInterface'
+
+                  - 'elasticloadbalancing:DeregisterInstancesFromLoadBalancer'
+                  - 'elasticloadbalancing:DeregisterTargets'
+                  - 'elasticloadbalancing:Describe*'
+                  - 'elasticloadbalancing:RegisterInstancesWithLoadBalancer'
+                  - 'elasticloadbalancing:RegisterTargets'
+                Resource: '*'
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ ecs-tasks.amazonaws.com ]
+            Action: [ 'sts:AssumeRole' ]
+      Path: /
+      Policies:
+        - PolicyName: AmazonECSTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  # Allow the ECS Tasks to download images from ECR
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+
+                  # Allow the ECS tasks to upload logs to CloudWatch
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+
+  TaskRoleCatalogService:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+
+  PrivateDNSNamespace:
+    Type: 'AWS::ServiceDiscovery::PrivateDnsNamespace'
+    Properties:
+      Vpc: !Ref VPC
+      Name: !Ref PrivateDNSNamespaceName
+
+  ServiceDiscoveryServiceCatalogService:
+    Type: 'AWS::ServiceDiscovery::Service'
+    Properties:
+      DnsConfig:
+        DnsRecords:
+          - Type: SRV
+            TTL: 60
+        NamespaceId: !Ref PrivateDNSNamespace
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+      Name: 'polar-bookshop.catalog-service'
+
+  TaskDefinitionCatalogService:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      NetworkMode: awsvpc
+      Memory: '512'
+      Cpu: '256'
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRoleCatalogService.Arn
+      ContainerDefinitions:
+        - Name: 'CatalogService'
+          Image: '553294056291.dkr.ecr.us-east-2.amazonaws.com/polarbookshop:latest'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 9001
+              Protocol: tcp
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: 'testdata'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AWS::StackName
+              awslogs-region: !Ref AWS::Region
+              awslogs-create-group: true
+              awslogs-stream-prefix: "polar"
+
+  ServiceCatalogService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - PrivateRouteOne
+    Properties:
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinitionCatalogService
+      LaunchType: FARGATE
+      DesiredCount: 1
+      ServiceRegistries:
+        - RegistryArn: !GetAtt ServiceDiscoveryServiceCatalogService.Arn
+          Port: 9001
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnetOne
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
+
+  AutoScalingTargetCatalogService:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref MinContainersCatalogService
+      MaxCapacity: !Ref MaxContainersCatalogServices
+      ResourceId: !Join [ '/', [ service, !Ref ECSCluster, !GetAtt ServiceCatalogService.Name ] ]
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !GetAtt AutoScalingRole.Arn
+
+  AutoScalingPolicyCatalogService:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Join [ '', [ !GetAtt ServiceCatalogService.Name, '-AutoScalingPolicy' ] ]
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTargetCatalogService
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: !Ref AutoScalingTargetValueCatalogService
+
+  HttpApiVPCLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Ref EnvironmentName
+      SecurityGroupIds:
+        - !Ref ContainerSecurityGroup
+      SubnetIds:
+        - !Ref PrivateSubnetOne
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+
+  UserPoolClient:
+    Type: "AWS::Cognito::UserPoolClient"
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      SupportedIdentityProviders:
+        - COGNITO
+      PreventUserExistenceErrors: ENABLED
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Body:
+        openapi: "3.0.1"
+        info:
+          title: !Ref EnvironmentName
+        components:
+          securitySchemes:
+            my-authorizer:
+              type: oauth2
+              flows: { }
+              x-amazon-apigateway-authorizer:
+                identitySource: "$request.header.Authorization"
+                jwtConfiguration:
+                  audience:
+                    - !Ref 'UserPoolClient'
+                  issuer: !GetAtt 'UserPool.ProviderURL'
+                type: jwt
+        paths:
+          /books:
+            get:
+              responses:
+                default:
+                  description: "Default response for GET /books"
+              x-amazon-apigateway-integration:
+                payloadFormatVersion: "1.0"
+                connectionId: !Ref HttpApiVPCLink
+                type: "http_proxy"
+                httpMethod: "ANY"
+                uri: !GetAtt ServiceDiscoveryServiceCatalogService.Arn
+                connectionType: "VPC_LINK"
+        x-amazon-apigateway-cors:
+          # This is a Test client web app that invokes the API, used in the blog post, for demostration purposes only.
+          # In production, make sure that you do NOT allow any untrusted origin.
+          allowOrigins:
+            - 'https://master.d34am23lsz3nvz.amplifyapp.com'
+          allowHeaders:
+            - '*'
+          allowMethods:
+            - 'PUT'
+            - 'GET'
+        x-amazon-apigateway-importexport-version: "1.0"
+
+  HttpApiStage:
+    Type: 'AWS::ApiGatewayV2::Stage'
+    Properties:
+      StageName: '$default'
+      ApiId: !Ref 'HttpApi'
+      AutoDeploy: true
+
+Outputs:
+  APITestPage:
+    Description: The URL of the sample web app client, used to test the sample API
+    Value: !Join
+      - ''
+      - - "https://master.d34am23lsz3nvz.amplifyapp.com/?stackregion="
+        - !Ref 'AWS::Region'
+        - "&stackhttpapi="
+        - !Ref 'HttpApi'
+        - "&stackuserpool="
+        - !Ref 'UserPool'
+        - "&stackuserpoolclient="
+        - !Ref 'UserPoolClient'
+  APIInvokeURL:
+    Description: Invoke URL for the HTTP API
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  APIInvokeURLCatalogService:
+    Description: Invoke URL for the HTTP API for the service Polar Bookshop Catalog
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/books'
+  APIId:
+    Description: The ID of the HTTP API
+    Value: !Ref 'HttpApi'
+  ECSClusterName:
+    Description: The name of the ECS cluster
+    Value: !Ref 'ECSCluster'
+  VpcId:
+    Description: The ID of the VPC that this stack is deployed in
+    Value: !Ref 'VPC'
+  ContainerSecurityGroup:
+    Description: A security group used to allow Fargate containers to receive traffic
+    Value: !Ref 'ContainerSecurityGroup'
+  PrivateDNSNamespace:
+    Description: The ID of the private DNS namespace.
+    Value: !Ref 'PrivateDNSNamespace'
